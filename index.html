@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Block Maze - Battle Edition</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: Arial; }
+    canvas { display: block; }
+    #ui { position: absolute; top: 20px; left: 20px; color: white; font-size: 24px; text-shadow: 2px 2px 4px #000; }
+    #hearts { position: absolute; top: 20px; right: 20px; font-size: 32px; }
+    #message { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 48px; text-shadow: 2px 2px 4px #000; display: none; text-align: center; }
+    #enemies { position: absolute; top: 60px; right: 20px; color: #FF6B6B; font-size: 18px; }
+    #instructions { position: absolute; bottom: 20px; left: 20px; color: white; font-size: 16px; text-shadow: 1px 1px 2px #000; }
+  </style>
+</head>
+<body>
+  <div id="ui"><div>Level: <span id="level">1</span></div><div>Coins: <span id="coins">0</span>/<span id="totalCoins">0</span></div><div>Time: <span id="timer">0.0</span>s</div></div>
+  <div id="hearts">❤️❤️❤️</div>
+  <div id="enemies"></div>
+  <div id="message"></div>
+  <div id="instructions">Click to start | W/A/S/D = Move | Mouse = Look | SPACE = Attack</div>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.0/build/three.module.js';
+
+    let level = 1, coins = 0, totalCoins = 0, hearts = 3, maxHearts = 3, startTime = Date.now(), gameStarted = false;
+    let playerPos = { x: 1, z: 1 }, goalPos = { x: 0, z: 0 }, mazeSize = 11, maze = [], coinPositions = [], trapPositions = [], enemies = [], arrows = [];
+    let lastAttackTime = 0, attackCooldown = 800;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1a2e);
+    scene.fog = new THREE.Fog(0x1a1a2e, 1, 18);
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0x404060, 0.5));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+    const playerLight = new THREE.PointLight(0x88ff88, 1, 10);
+    scene.add(playerLight);
+
+    const materials = {
+      wall: new THREE.MeshStandardMaterial({ color: 0x4a3728 }),
+      floor: new THREE.MeshStandardMaterial({ color: 0x2d4a2d }),
+      player: new THREE.MeshStandardMaterial({ color: 0x00cc66 }),
+      goal: new THREE.MeshStandardMaterial({ color: 0xFFD700, emissive: 0xFFD700, emissiveIntensity: 0.5 }),
+      coin: new THREE.MeshStandardMaterial({ color: 0xFFD700, emissive: 0xFFD700, emissiveIntensity: 0.6 }),
+      trap: new THREE.MeshStandardMaterial({ color: 0xFF4444 }),
+      zombie: new THREE.MeshStandardMaterial({ color: 0x44aa44 }),
+      skeleton: new THREE.MeshStandardMaterial({ color: 0xeeeeee }),
+      arrow: new THREE.MeshStandardMaterial({ color: 0xffffff }),
+      sword: new THREE.MeshStandardMaterial({ color: 0xaaaaaa, emissive: 0x555555, emissiveIntensity: 0.4 })
+    };
+
+    function generateMaze(width, height) {
+      const maze = Array(height).fill().map(() => Array(width).fill(1));
+      const visited = Array(height).fill().map(() => Array(width).fill(false));
+      function carve(x, y) {
+        visited[y][x] = true;
+        maze[y][x] = 0;
+        const directions = [[0,-2], [0,2], [-2,0], [2,0]].sort(() => Math.random() - 0.5);
+        for (const [dx, dy] of directions) {
+          const nx = x + dx, ny = y + dy;
+          if (nx > 0 && nx < width-1 && ny > 0 && ny < height-1 && !visited[ny][nx]) {
+            maze[y + dy/2][x + dx/2] = 0;
+            carve(nx, ny);
+          }
+        }
+      }
+      carve(1, 1);
+      maze[height-2][width-2] = 0;
+      return maze;
+    }
+
+    function generateObjects() {
+      coinPositions = [];
+      trapPositions = [];
+      coins = 0;
+      totalCoins = Math.floor(mazeSize / 3);
+      const emptySpots = [];
+      for (let z = 1; z < mazeSize-1; z++) {
+        for (let x = 1; x < mazeSize-1; x++) {
+          if (maze[z][x] === 0 && !(x === 1 && z === 1) && !(x === goalPos.x && z === goalPos.z)) {
+            emptySpots.push({ x, z });
+          }
+        }
+      }
+      emptySpots.sort(() => Math.random() - 0.5);
+      for (let i = 0; i < totalCoins; i++) {
+        if (emptySpots[i]) coinPositions.push({ ...emptySpots[i], collected: false });
+      }
+      const numTraps = Math.floor(mazeSize / 5);
+      for (let i = totalCoins; i < totalCoins + numTraps; i++) {
+        if (emptySpots[i]) trapPositions.push(emptySpots[i]);
+      }
+      goalPos = emptySpots[emptySpots.length - 1];
+      generateEnemies(emptySpots, totalCoins + numTraps);
+    }
+
+    function generateEnemies(emptySpots, startIndex) {
+      enemies.forEach(e => scene.remove(e.mesh));
+      arrows.forEach(a => scene.remove(a.mesh));
+      enemies = [];
+      arrows = [];
+      const numEnemies = 1 + Math.floor(Math.random() * 2) + Math.floor(level / 2);
+      for (let i = 0; i < numEnemies; i++) {
+        const spot = emptySpots[startIndex + i];
+        if (!spot) continue;
+        const type = Math.random() > 0.5 ? 'zombie' : 'skeleton';
+        const group = new THREE.Group();
+        if (type === 'zombie') {
+          const body = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.9, 0.3), materials.zombie);
+          body.position.y = 0.45;
+          group.add(body);
+          const head = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 0.4), materials.zombie);
+          head.position.y = 1.1;
+          group.add(head);
+          const arms = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.2, 0.2), materials.zombie);
+          arms.position.y = 0.7;
+          group.add(arms);
+        } else {
+          const body = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.8, 0.25), materials.skeleton);
+          body.position.y = 0.4;
+          group.add(body);
+          const head = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.35, 0.3), materials.skeleton);
+          head.position.y = 1.0;
+          group.add(head);
+          const bow = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.02, 8, 16, Math.PI), materials.sword);
+          bow.position.set(0.25, 0.5, 0);
+          bow.rotation.z = Math.PI / 2;
+          group.add(bow);
+        }
+        group.position.set(spot.x, 0, spot.z);
+        scene.add(group);
+        enemies.push({ type, mesh: group, pos: { x: spot.x, z: spot.z }, health: type === 'zombie' ? 3 : 2, maxHealth: type === 'zombie' ? 3 : 2, state: 'patrol', shootTimer: 2 + Math.random() * 2 });
+      }
+      updateEnemyUI();
+    }
+
+    let wallGroup, coinGroup, trapGroup, goalMesh, playerMesh, floorMesh, swordMesh;
+
+    function buildMaze() {
+      if (wallGroup) scene.remove(wallGroup);
+      if (coinGroup) scene.remove(coinGroup);
+      if (trapGroup) scene.remove(trapGroup);
+      if (goalMesh) scene.remove(goalMesh);
+      if (playerMesh) scene.remove(playerMesh);
+      if (floorMesh) scene.remove(floorMesh);
+      if (swordMesh) scene.remove(swordMesh);
+      enemies.forEach(e => scene.remove(e.mesh));
+      arrows.forEach(a => scene.remove(a.mesh));
+      enemies = [];
+      arrows = [];
+      mazeSize = 9 + level * 2;
+      maze = generateMaze(mazeSize, mazeSize);
+      floorMesh = new THREE.Mesh(new THREE.BoxGeometry(mazeSize, 1, mazeSize), materials.floor);
+      floorMesh.position.set(mazeSize/2, -0.5, mazeSize/2);
+      scene.add(floorMesh);
+      wallGroup = new THREE.Group();
+      for (let z = 0; z < mazeSize; z++) {
+        for (let x = 0; x < mazeSize; x++) {
+          if (maze[z][x] === 1) {
+            const wall = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), materials.wall);
+            wall.position.set(x, 1, z);
+            wallGroup.add(wall);
+          }
+        }
+      }
+      scene.add(wallGroup);
+      generateObjects();
+      goalMesh = new THREE.Mesh(new THREE.BoxGeometry(0.6, 0.6, 0.6), materials.goal);
+      goalMesh.position.set(goalPos.x, 0.5, goalPos.z);
+      scene.add(goalMesh);
+      coinGroup = new THREE.Group();
+      coinPositions.forEach((pos, i) => {
+        const coin = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.25, 0.08), materials.coin);
+        coin.position.set(pos.x, 0.5, pos.z);
+        coin.userData.index = i;
+        coinGroup.add(coin);
+      });
+      scene.add(coinGroup);
+      trapGroup = new THREE.Group();
+      trapPositions.forEach(pos => {
+        const trap = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.08, 0.7), materials.trap);
+        trap.position.set(pos.x, 0.04, pos.z);
+        trapGroup.add(trap);
+      });
+      scene.add(trapGroup);
+      playerPos = { x: 1, z: 1 };
+      playerMesh = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.8, 0.3), materials.player);
+      body.position.y = 0.4;
+      playerMesh.add(body);
+      const head = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.35, 0.35), new THREE.MeshStandardMaterial({ color: 0xffccaa }));
+      head.position.y = 0.95;
+      playerMesh.add(head);
+      playerMesh.position.set(playerPos.x, 0, playerPos.z);
+      scene.add(playerMesh);
+      swordMesh = new THREE.Group();
+      const blade = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.5, 0.02), materials.sword);
+      blade.position.y = 0.25;
+      swordMesh.add(blade);
+      const handle = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.15, 0.06), new THREE.MeshStandardMaterial({ color: 0x4a3520 }));
+      handle.position.y = -0.025;
+      swordMesh.add(handle);
+      const guard = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.03, 0.06), materials.sword);
+      guard.position.y = 0.08;
+      swordMesh.add(guard);
+      swordMesh.position.set(0.35, 0.5, 0.15);
+      swordMesh.rotation.x = -Math.PI / 4;
+      playerMesh.add(swordMesh);
+      camera.position.set(playerPos.x, 0.8, playerPos.z);
+      startTime = Date.now();
+      gameStarted = false;
+      updateUI();
+      updateHearts();
+    }
+
+    function canMove(x, z) {
+      if (x < 0 || x >= mazeSize || z < 0 || z >= mazeSize) return false;
+      return maze[z][x] === 0;
+    }
+
+    function updateUI() {
+      document.getElementById('level').textContent = level;
+      document.getElementById('coins').textContent = coins;
+      document.getElementById('totalCoins').textContent = totalCoins;
+      document.getElementById('timer').textContent = ((Date.now() - startTime) / 1000).toFixed(1);
+    }
+
+    function updateHearts() {
+      let heartsStr = '';
+      for (let i = 0; i < maxHearts; i++) { heartsStr += i < hearts ? '❤️' : '🖤'; }
+      document.getElementById('hearts').textContent = heartsStr;
+    }
+
+    function updateEnemyUI() {
+      const zombieCount = enemies.filter(e => e.type === 'zombie').length;
+      const skeletonCount = enemies.filter(e => e.type === 'skeleton').length;
+      document.getElementById('enemies').innerHTML = `🧟 Zombies: ${zombieCount} | 💀 Skeletons: ${skeletonCount}`;
+    }
+
+    function showMessage(text, duration = 2000) {
+      const msg = document.getElementById('message');
+      msg.textContent = text;
+      msg.style.display = 'block';
+      if (duration) setTimeout(() => msg.style.display = 'none', duration);
+    }
+
+    function damagePlayer() {
+      hearts--;
+      updateHearts();
+      showMessage('💔 Ouch!', 500);
+      if (hearts <= 0) {
+        showMessage('☠️ Died! Respawning...', 2000);
+        hearts = maxHearts;
+        playerPos = { x: 1, z: 1 };
+        playerMesh.position.set(1, 0, 1);
+        camera.position.set(1, 0.8, 1);
+        updateHearts();
+      }
+    }
+
+    function attack() {
+      const now = Date.now();
+      if (now - lastAttackTime < attackCooldown) return;
+      lastAttackTime = now;
+      swordMesh.rotation.x = -Math.PI / 2;
+      setTimeout(() => swordMesh.rotation.x = -Math.PI / 4, 200);
+      const attackRange = 1.5;
+      enemies.forEach(enemy => {
+        const dist = Math.sqrt(Math.pow(enemy.pos.x - playerPos.x, 2) + Math.pow(enemy.pos.z - playerPos.z, 2));
+        if (dist < attackRange) {
+          enemy.health--;
+          if (enemy.health <= 0) {
+            scene.remove(enemy.mesh);
+            enemy.mesh = null;
+          } else {
+            enemy.mesh.scale.setScalar(1.2);
+            setTimeout(() => enemy.mesh.scale.setScalar(1), 100);
+          }
+        }
+      });
+      enemies = enemies.filter(e => e.mesh);
+      updateEnemyUI();
+    }
+
+    const keys = {};
+    let yaw = 0, pitch = 0;
+    window.addEventListener('keydown', e => { keys[e.code] = true; if (!gameStarted && ['KeyW','KeyA','KeyS','KeyD'].includes(e.code)) gameStarted = true; if (e.code === 'Space') attack(); });
+    window.addEventListener('keyup', e => keys[e.code] = false); 
+    document.addEventListener('click', () => { renderer.domElement.requestPointerLock(); if (!gameStarted) gameStarted = true; });document.addEventListener('click', () => { renderer.domElement.requestPointerLock(); if (!gameStarted) gameStarted = true; }); 
+        document.addEventListener('mousemove', e => {
+      if (document.pointerLockElement === renderer.domElement) {
+        yaw -= e.movementX * 0.002;
+        pitch -= e.movementY * 0.002;
+        pitch = Math.max(-0.5, Math.min(0.5, pitch));
+      }
+    });
+
+    let lastTime = 0;
+    function animate(time) {
+      requestAnimationFrame(animate);
+      const delta = (time - lastTime) / 1000;
+      lastTime = time;
+
+      if (keys['KeyW'] || keys['KeyS'] || keys['KeyA'] || keys['KeyD']) {
+        const speed = 3 * delta;
+        const direction = new THREE.Vector3();
+        if (keys['KeyW']) direction.z -= 1;
+        if (keys['KeyS']) direction.z += 1;
+        if (keys['KeyA']) direction.x -= 1;
+        if (keys['KeyD']) direction.x += 1;
+        direction.normalize();
+        direction.applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+
+        const newX = Math.round(playerPos.x + direction.x * speed);
+        const newZ = Math.round(playerPos.z + direction.z * speed);
+
+        if (canMove(newX, Math.round(playerPos.z))) playerPos.x = newX;
+        if (canMove(Math.round(playerPos.x), newZ)) playerPos.z = newZ;
+
+        playerMesh.position.set(playerPos.x, 0, playerPos.z);
+
+        // Collect coins
+        coinPositions.forEach((pos, i) => {
+          if (pos && !pos.collected && Math.abs(playerPos.x - pos.x) < 0.5 && Math.abs(playerPos.z - pos.z) < 0.5) {
+            pos.collected = true;
+            coins++;
+            if (coinGroup.children[i]) coinGroup.children[i].visible = false;
+          }
+        });
+
+        // Hit trap
+        trapPositions.forEach(pos => {
+          if (Math.abs(playerPos.x - pos.x) < 0.5 && Math.abs(playerPos.z - pos.z) < 0.5) {
+            showMessage('💀 Trap!', 1000);
+            damagePlayer();
+          }
+        });
+
+        // Reach goal
+        if (Math.abs(playerPos.x - goalPos.x) < 0.5 && Math.abs(playerPos.z - goalPos.z) < 0.5) {
+          level++;
+          showMessage('🎉 Level Complete!', 2000);
+          buildMaze();
+        }
+
+        updateUI();
+      }
+
+      // Player follow camera
+      camera.position.set(playerPos.x, 0.8, playerPos.z);
+      camera.rotation.set(pitch, yaw, 0, 'YXZ');
+      playerLight.position.set(playerPos.x, 1, playerPos.z);
+
+      // Animate coins
+      coinGroup.children.forEach((coin, i) => {
+        if (coin.visible) {
+          coin.rotation.y += delta * 2;
+          coin.position.y = 0.5 + Math.sin(time * 0.003 + i) * 0.1;
+        }
+      });
+
+      // Goal pulse
+      if (goalMesh) {
+        goalMesh.scale.setScalar(1 + Math.sin(time * 0.005) * 0.2);
+      }
+
+      // Enemy AI
+      enemies.forEach(enemy => {
+        const dist = Math.sqrt(Math.pow(enemy.pos.x - playerPos.x, 2) + Math.pow(enemy.pos.z - playerPos.z, 2));
+
+        // Chase player if close
+        if (dist < 6 && dist > 1) {
+          const moveX = (playerPos.x - enemy.pos.x) / dist * 0.5 * delta;
+          const moveZ = (playerPos.z - enemy.pos.z) / dist * 0.5 * delta;
+          if (canMove(Math.round(enemy.pos.x + moveX), Math.round(enemy.pos.z))) enemy.pos.x += moveX;
+          if (canMove(Math.round(enemy.pos.x), Math.round(enemy.pos.z + moveZ))) enemy.pos.z += moveZ;
+          enemy.mesh.position.set(enemy.pos.x, 0, enemy.pos.z);
+        }
+
+        // Damage player on contact
+        if (dist < 0.5) {
+          damagePlayer();
+        }
+
+        // Skeleton shoots
+        if (enemy.type === 'skeleton') {
+          enemy.shootTimer -= delta;
+          if (enemy.shootTimer <= 0 && dist < 8) {
+            enemy.shootTimer = 3 + Math.random() * 2;
+            const arrow = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.03, 0.03), materials.arrow);
+            arrow.position.copy(enemy.mesh.position);
+            arrow.position.y = 0.8;
+            scene.add(arrow);
+            const dir = new THREE.Vector3(playerPos.x - enemy.pos.x, 0.2, playerPos.z - enemy.pos.z).normalize();
+            arrows.push({ mesh: arrow, dir, life: 3 });
+          }
+        }
+      });
+
+      // Update arrows
+      arrows.forEach((arrow, i) => {
+        arrow.mesh.position.x += arrow.dir.x * 3 * delta;
+        arrow.mesh.position.y += arrow.dir.y * 3 * delta;
+        arrow.mesh.position.z += arrow.dir.z * 3 * delta;
+        arrow.life -= delta;
+
+        // Hit player
+        if (Math.abs(arrow.mesh.position.x - playerPos.x) < 0.4 && Math.abs(arrow.mesh.position.z - playerPos.z) < 0.4) {
+          damagePlayer();
+          scene.remove(arrow.mesh);
+          arrow.life = 0;
+        }
+
+        if (arrow.life <= 0) {
+          scene.remove(arrow.mesh);
+        }
+      });
+      arrows = arrows.filter(a => a.life > 0);
+
+      renderer.render(scene, camera);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    buildMaze();
+    showMessage('Click to Start!', 0);
+    animate(0);
+  </script>
+</body>
+</html>
